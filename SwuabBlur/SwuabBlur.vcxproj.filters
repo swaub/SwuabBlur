@@ -18,5 +18,11 @@
     <ClCompile Include="main.c">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="config.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="video.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
 </Project>
