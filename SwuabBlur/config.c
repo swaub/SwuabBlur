@@ -13,6 +13,7 @@
 #define strcasecmp _stricmp
 #define strncasecmp _strnicmp
 #define access _access
+#define strdup _strdup
 #else
 #include <unistd.h>
 #endif
@@ -649,17 +650,6 @@ static int getopt_long(int argc, char* const argv[], const char* optstring,
 
     return c;
 }
-
-struct option {
-    const char* name;
-    int has_arg;
-    int* flag;
-    int val;
-};
-
-#define no_argument 0
-#define required_argument 1
-#define optional_argument 2
 #endif
 
 static void apply_preset(BlurConfig* config, const char* preset) {
