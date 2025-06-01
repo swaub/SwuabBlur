@@ -4,12 +4,19 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <math.h>
-#include <pthread.h>
 
 #ifdef _WIN32
 #include <windows.h>
+typedef HANDLE pthread_t;
+typedef HANDLE pthread_mutex_t;
+typedef HANDLE pthread_cond_t;
+#define THREAD_FUNC DWORD WINAPI
+#define THREAD_RETURN DWORD
 #else
+#include <pthread.h>
 #include <dlfcn.h>
+#define THREAD_FUNC void*
+#define THREAD_RETURN void*
 #endif
 
 #include <libavcodec/avcodec.h>
@@ -23,8 +30,18 @@
 #include <libavfilter/buffersrc.h>
 #include <libavutil/hwcontext.h>
 
+#ifdef HAVE_VAPOURSYNTH
 #include <vapoursynth/VapourSynth.h>
 #include <vapoursynth/VSHelper.h>
+#endif
+
+#ifndef CLAMP
+#define CLAMP(x, min, max) ((x) < (min) ? (min) : ((x) > (max) ? (max) : (x)))
+#endif
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 
 typedef struct {
     bool blur;
@@ -85,6 +102,7 @@ typedef struct {
     AVBufferRef* hw_device_ctx;
 } VideoContext;
 
+#ifdef HAVE_VAPOURSYNTH
 typedef struct {
     VSCore* core;
     VSScript* script;
@@ -92,6 +110,7 @@ typedef struct {
     const VSAPI* vsapi;
     void* library;
 } VapourSynthContext;
+#endif
 
 typedef struct {
     uint8_t** data;
@@ -99,6 +118,8 @@ typedef struct {
     int width;
     int height;
     int64_t pts;
+    int format;
+    bool allocated;
 } FrameBuffer;
 
 typedef struct {
@@ -107,29 +128,88 @@ typedef struct {
     int count;
     int read_pos;
     int write_pos;
+    bool finished;
+#ifdef _WIN32
+    HANDLE mutex;
+    HANDLE not_empty;
+    HANDLE not_full;
+#else
     pthread_mutex_t mutex;
     pthread_cond_t not_empty;
     pthread_cond_t not_full;
+#endif
 } FrameQueue;
+
+typedef struct {
+    FrameBuffer* buffer;
+    int count;
+    int capacity;
+    int current_pos;
+} BlurFrameBuffer;
 
 static VideoContext* g_input_ctx = NULL;
 static VideoContext* g_output_ctx = NULL;
-static VapourSynthContext* g_vs_ctx = NULL;
 static FrameQueue* g_frame_queue = NULL;
 static AVFilterGraph* g_filter_graph = NULL;
 static AVFilterContext* g_buffersrc_ctx = NULL;
 static AVFilterContext* g_buffersink_ctx = NULL;
 
+#ifdef HAVE_VAPOURSYNTH
+static VapourSynthContext* g_vs_ctx = NULL;
+#endif
+
 extern void update_progress(int64_t frames);
 extern bool is_interrupted(void);
 extern float* config_get_weights(const BlurConfig* config, int frame_count, int* weight_count);
 
+#ifdef _WIN32
 static void frame_queue_init(FrameQueue* queue, int capacity) {
     queue->frames = (FrameBuffer*)calloc(capacity, sizeof(FrameBuffer));
     queue->capacity = capacity;
     queue->count = 0;
     queue->read_pos = 0;
     queue->write_pos = 0;
+    queue->finished = false;
+    queue->mutex = CreateMutex(NULL, FALSE, NULL);
+    queue->not_empty = CreateEvent(NULL, FALSE, FALSE, NULL);
+    queue->not_full = CreateEvent(NULL, FALSE, FALSE, NULL);
+}
+
+static void frame_queue_destroy(FrameQueue* queue) {
+    if (!queue) return;
+
+    for (int i = 0; i < queue->capacity; i++) {
+        if (queue->frames[i].allocated && queue->frames[i].data) {
+            for (int j = 0; j < 4; j++) {
+                if (queue->frames[i].data[j]) {
+                    av_free(queue->frames[i].data[j]);
+                }
+            }
+            av_free(queue->frames[i].data);
+            av_free(queue->frames[i].linesize);
+        }
+    }
+
+    free(queue->frames);
+    CloseHandle(queue->mutex);
+    CloseHandle(queue->not_empty);
+    CloseHandle(queue->not_full);
+}
+
+static void frame_queue_signal_finished(FrameQueue* queue) {
+    WaitForSingleObject(queue->mutex, INFINITE);
+    queue->finished = true;
+    SetEvent(queue->not_empty);
+    ReleaseMutex(queue->mutex);
+}
+#else
+static void frame_queue_init(FrameQueue* queue, int capacity) {
+    queue->frames = (FrameBuffer*)calloc(capacity, sizeof(FrameBuffer));
+    queue->capacity = capacity;
+    queue->count = 0;
+    queue->read_pos = 0;
+    queue->write_pos = 0;
+    queue->finished = false;
     pthread_mutex_init(&queue->mutex, NULL);
     pthread_cond_init(&queue->not_empty, NULL);
     pthread_cond_init(&queue->not_full, NULL);
@@ -139,7 +219,7 @@ static void frame_queue_destroy(FrameQueue* queue) {
     if (!queue) return;
 
     for (int i = 0; i < queue->capacity; i++) {
-        if (queue->frames[i].data) {
+        if (queue->frames[i].allocated && queue->frames[i].data) {
             for (int j = 0; j < 4; j++) {
                 if (queue->frames[i].data[j]) {
                     av_free(queue->frames[i].data[j]);
@@ -156,92 +236,148 @@ static void frame_queue_destroy(FrameQueue* queue) {
     pthread_cond_destroy(&queue->not_full);
 }
 
+static void frame_queue_signal_finished(FrameQueue* queue) {
+    pthread_mutex_lock(&queue->mutex);
+    queue->finished = true;
+    pthread_cond_broadcast(&queue->not_empty);
+    pthread_mutex_unlock(&queue->mutex);
+}
+#endif
+
+static bool frame_buffer_alloc(FrameBuffer* buffer, int width, int height, int format) {
+    buffer->width = width;
+    buffer->height = height;
+    buffer->format = format;
+    buffer->data = (uint8_t**)av_malloc(4 * sizeof(uint8_t*));
+    buffer->linesize = (int*)av_malloc(4 * sizeof(int));
+
+    if (!buffer->data || !buffer->linesize) {
+        return false;
+    }
+
+    int ret = av_image_alloc(buffer->data, buffer->linesize, width, height, format, 32);
+    if (ret < 0) {
+        av_free(buffer->data);
+        av_free(buffer->linesize);
+        return false;
+    }
+
+    buffer->allocated = true;
+    return true;
+}
+
+static void frame_buffer_copy(FrameBuffer* dst, AVFrame* src) {
+    if (!dst->allocated) {
+        frame_buffer_alloc(dst, src->width, src->height, src->format);
+    }
+
+    av_image_copy(dst->data, dst->linesize,
+        (const uint8_t**)src->data, src->linesize,
+        src->format, src->width, src->height);
+    dst->pts = src->pts;
+}
+
+static void frame_buffer_to_avframe(FrameBuffer* buffer, AVFrame* frame) {
+    for (int i = 0; i < 4; i++) {
+        frame->data[i] = buffer->data[i];
+        frame->linesize[i] = buffer->linesize[i];
+    }
+    frame->width = buffer->width;
+    frame->height = buffer->height;
+    frame->format = buffer->format;
+    frame->pts = buffer->pts;
+}
+
 static bool frame_queue_push(FrameQueue* queue, AVFrame* frame) {
+#ifdef _WIN32
+    WaitForSingleObject(queue->mutex, INFINITE);
+
+    while (queue->count >= queue->capacity && !is_interrupted()) {
+        ReleaseMutex(queue->mutex);
+        WaitForSingleObject(queue->not_full, 1000);
+        WaitForSingleObject(queue->mutex, INFINITE);
+    }
+
+    if (is_interrupted()) {
+        ReleaseMutex(queue->mutex);
+        return false;
+    }
+#else
     pthread_mutex_lock(&queue->mutex);
 
     while (queue->count >= queue->capacity && !is_interrupted()) {
-        pthread_cond_wait(&queue->not_full, &queue->mutex);
+        struct timespec timeout;
+        clock_gettime(CLOCK_REALTIME, &timeout);
+        timeout.tv_sec += 1;
+        pthread_cond_timedwait(&queue->not_full, &queue->mutex, &timeout);
     }
 
     if (is_interrupted()) {
         pthread_mutex_unlock(&queue->mutex);
         return false;
     }
+#endif
 
     FrameBuffer* buffer = &queue->frames[queue->write_pos];
-
-    if (!buffer->data) {
-        buffer->data = (uint8_t**)av_malloc(4 * sizeof(uint8_t*));
-        buffer->linesize = (int*)av_malloc(4 * sizeof(int));
-        buffer->width = frame->width;
-        buffer->height = frame->height;
-
-        for (int i = 0; i < 4; i++) {
-            if (frame->data[i]) {
-                int size = frame->linesize[i] * frame->height;
-                if (i > 0) size >>= 1;
-                buffer->data[i] = (uint8_t*)av_malloc(size);
-                buffer->linesize[i] = frame->linesize[i];
-            }
-            else {
-                buffer->data[i] = NULL;
-                buffer->linesize[i] = 0;
-            }
-        }
-    }
-
-    for (int i = 0; i < 4; i++) {
-        if (frame->data[i]) {
-            int h = frame->height;
-            if (i > 0) h >>= 1;
-            for (int y = 0; y < h; y++) {
-                memcpy(buffer->data[i] + y * buffer->linesize[i],
-                    frame->data[i] + y * frame->linesize[i],
-                    frame->linesize[i]);
-            }
-        }
-    }
-
-    buffer->pts = frame->pts;
+    frame_buffer_copy(buffer, frame);
 
     queue->write_pos = (queue->write_pos + 1) % queue->capacity;
     queue->count++;
 
+#ifdef _WIN32
+    SetEvent(queue->not_empty);
+    ReleaseMutex(queue->mutex);
+#else
     pthread_cond_signal(&queue->not_empty);
     pthread_mutex_unlock(&queue->mutex);
+#endif
 
     return true;
 }
 
 static bool frame_queue_pop(FrameQueue* queue, AVFrame* frame) {
-    pthread_mutex_lock(&queue->mutex);
+#ifdef _WIN32
+    WaitForSingleObject(queue->mutex, INFINITE);
 
-    while (queue->count == 0 && !is_interrupted()) {
-        pthread_cond_wait(&queue->not_empty, &queue->mutex);
+    while (queue->count == 0 && !queue->finished && !is_interrupted()) {
+        ReleaseMutex(queue->mutex);
+        WaitForSingleObject(queue->not_empty, 1000);
+        WaitForSingleObject(queue->mutex, INFINITE);
     }
 
-    if (is_interrupted()) {
+    if ((queue->count == 0 && queue->finished) || is_interrupted()) {
+        ReleaseMutex(queue->mutex);
+        return false;
+    }
+#else
+    pthread_mutex_lock(&queue->mutex);
+
+    while (queue->count == 0 && !queue->finished && !is_interrupted()) {
+        struct timespec timeout;
+        clock_gettime(CLOCK_REALTIME, &timeout);
+        timeout.tv_sec += 1;
+        pthread_cond_timedwait(&queue->not_empty, &queue->mutex, &timeout);
+    }
+
+    if ((queue->count == 0 && queue->finished) || is_interrupted()) {
         pthread_mutex_unlock(&queue->mutex);
         return false;
     }
+#endif
 
     FrameBuffer* buffer = &queue->frames[queue->read_pos];
-
-    for (int i = 0; i < 4; i++) {
-        frame->data[i] = buffer->data[i];
-        frame->linesize[i] = buffer->linesize[i];
-    }
-
-    frame->width = buffer->width;
-    frame->height = buffer->height;
-    frame->pts = buffer->pts;
-    frame->format = AV_PIX_FMT_YUV420P;
+    frame_buffer_to_avframe(buffer, frame);
 
     queue->read_pos = (queue->read_pos + 1) % queue->capacity;
     queue->count--;
 
+#ifdef _WIN32
+    SetEvent(queue->not_full);
+    ReleaseMutex(queue->mutex);
+#else
     pthread_cond_signal(&queue->not_full);
     pthread_mutex_unlock(&queue->mutex);
+#endif
 
     return true;
 }
@@ -258,7 +394,7 @@ static const char* get_hw_codec_name(const char* codec, const char* gpu_type, bo
             return encoding ? "h264_qsv" : "h264_qsv";
         }
     }
-    else if (strcmp(codec, "h265") == 0) {
+    else if (strcmp(codec, "h265") == 0 || strcmp(codec, "hevc") == 0) {
         if (strcmp(gpu_type, "nvidia") == 0) {
             return encoding ? "hevc_nvenc" : "hevc_cuvid";
         }
@@ -288,12 +424,26 @@ static enum AVHWDeviceType get_hw_device_type(const char* gpu_type) {
         return AV_HWDEVICE_TYPE_CUDA;
     }
     else if (strcmp(gpu_type, "amd") == 0) {
+#ifdef _WIN32
         return AV_HWDEVICE_TYPE_D3D11VA;
+#else
+        return AV_HWDEVICE_TYPE_VAAPI;
+#endif
     }
     else if (strcmp(gpu_type, "intel") == 0) {
         return AV_HWDEVICE_TYPE_QSV;
     }
     return AV_HWDEVICE_TYPE_NONE;
+}
+
+static enum AVPixelFormat get_pixel_format(const char* format_name) {
+    if (strcmp(format_name, "yuv420p") == 0) return AV_PIX_FMT_YUV420P;
+    if (strcmp(format_name, "yuv422p") == 0) return AV_PIX_FMT_YUV422P;
+    if (strcmp(format_name, "yuv444p") == 0) return AV_PIX_FMT_YUV444P;
+    if (strcmp(format_name, "yuv420p10le") == 0) return AV_PIX_FMT_YUV420P10LE;
+    if (strcmp(format_name, "yuv422p10le") == 0) return AV_PIX_FMT_YUV422P10LE;
+    if (strcmp(format_name, "yuv444p10le") == 0) return AV_PIX_FMT_YUV444P10LE;
+    return AV_PIX_FMT_YUV420P;
 }
 
 static bool open_input_video(VideoContext* ctx, const char* filename, const BlurConfig* config) {
@@ -302,13 +452,15 @@ static bool open_input_video(VideoContext* ctx, const char* filename, const Blur
     ctx->fmt_ctx = NULL;
     ret = avformat_open_input(&ctx->fmt_ctx, filename, NULL, NULL);
     if (ret < 0) {
-        fprintf(stderr, "Error opening input file: %s\n", filename);
+        char errbuf[AV_ERROR_MAX_STRING_SIZE];
+        av_strerror(ret, errbuf, AV_ERROR_MAX_STRING_SIZE);
+        fprintf(stderr, "Error opening input file '%s': %s\n", filename, errbuf);
         return false;
     }
 
     ret = avformat_find_stream_info(ctx->fmt_ctx, NULL);
     if (ret < 0) {
-        fprintf(stderr, "Error finding stream info\n");
+        fprintf(stderr, "Error finding stream information\n");
         return false;
     }
 
@@ -316,18 +468,20 @@ static bool open_input_video(VideoContext* ctx, const char* filename, const Blur
     ctx->audio_stream_idx = -1;
 
     for (unsigned int i = 0; i < ctx->fmt_ctx->nb_streams; i++) {
-        if (ctx->fmt_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+        if (ctx->fmt_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO &&
+            ctx->video_stream_idx == -1) {
             ctx->video_stream_idx = i;
             ctx->video_stream = ctx->fmt_ctx->streams[i];
         }
-        else if (ctx->fmt_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+        else if (ctx->fmt_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO &&
+            ctx->audio_stream_idx == -1) {
             ctx->audio_stream_idx = i;
             ctx->audio_stream = ctx->fmt_ctx->streams[i];
         }
     }
 
     if (ctx->video_stream_idx == -1) {
-        fprintf(stderr, "No video stream found\n");
+        fprintf(stderr, "No video stream found in input file\n");
         return false;
     }
 
@@ -337,13 +491,18 @@ static bool open_input_video(VideoContext* ctx, const char* filename, const Blur
         if (hw_type != AV_HWDEVICE_TYPE_NONE) {
             ret = av_hwdevice_ctx_create(&ctx->hw_device_ctx, hw_type, NULL, NULL, 0);
             if (ret < 0) {
-                fprintf(stderr, "Failed to create hardware device context\n");
+                if (config->verbose) {
+                    fprintf(stderr, "Warning: Failed to create hardware device context, using software decoding\n");
+                }
                 ctx->hw_device_ctx = NULL;
             }
             else {
                 codec_name = get_hw_codec_name(
                     avcodec_get_name(ctx->video_stream->codecpar->codec_id),
                     config->gpu_type, false);
+                if (config->verbose) {
+                    printf("Using hardware decoder: %s\n", codec_name);
+                }
             }
         }
     }
@@ -353,7 +512,7 @@ static bool open_input_video(VideoContext* ctx, const char* filename, const Blur
         avcodec_find_decoder(ctx->video_stream->codecpar->codec_id);
 
     if (!codec) {
-        fprintf(stderr, "Codec not found\n");
+        fprintf(stderr, "Codec not found for stream\n");
         return false;
     }
 
@@ -365,7 +524,7 @@ static bool open_input_video(VideoContext* ctx, const char* filename, const Blur
 
     ret = avcodec_parameters_to_context(ctx->codec_ctx, ctx->video_stream->codecpar);
     if (ret < 0) {
-        fprintf(stderr, "Failed to copy codec parameters\n");
+        fprintf(stderr, "Failed to copy codec parameters to decoder context\n");
         return false;
     }
 
@@ -375,6 +534,7 @@ static bool open_input_video(VideoContext* ctx, const char* filename, const Blur
 
     if (config->threads > 0) {
         ctx->codec_ctx->thread_count = config->threads;
+        ctx->codec_ctx->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
     }
 
     ret = avcodec_open2(ctx->codec_ctx, codec, NULL);
@@ -387,7 +547,7 @@ static bool open_input_video(VideoContext* ctx, const char* filename, const Blur
     ctx->packet = av_packet_alloc();
 
     if (!ctx->frame || !ctx->packet) {
-        fprintf(stderr, "Failed to allocate frame/packet\n");
+        fprintf(stderr, "Failed to allocate frame or packet\n");
         return false;
     }
 
@@ -398,54 +558,76 @@ static bool create_output_video(VideoContext* ctx, const char* filename, const B
     int width, int height, double fps) {
     int ret;
 
-    avformat_alloc_output_context2(&ctx->fmt_ctx, NULL, NULL, filename);
+    const char* format_name = NULL;
+    if (strstr(filename, ".mp4")) format_name = "mp4";
+    else if (strstr(filename, ".mkv")) format_name = "matroska";
+    else if (strstr(filename, ".avi")) format_name = "avi";
+    else if (strstr(filename, ".mov")) format_name = "mov";
+
+    ret = avformat_alloc_output_context2(&ctx->fmt_ctx, NULL, format_name, filename);
     if (!ctx->fmt_ctx) {
-        fprintf(stderr, "Failed to create output context\n");
+        fprintf(stderr, "Failed to create output format context\n");
         return false;
     }
 
-    const char* codec_name = NULL;
+    const char* codec_name = config->codec;
     if (config->gpu_encoding) {
         codec_name = get_hw_codec_name(config->codec, config->gpu_type, true);
+        if (config->verbose) {
+            printf("Using hardware encoder: %s\n", codec_name);
+        }
     }
 
-    const AVCodec* codec = codec_name ?
-        avcodec_find_encoder_by_name(codec_name) :
-        avcodec_find_encoder_by_name(config->codec);
+    const AVCodec* codec = avcodec_find_encoder_by_name(codec_name);
+    if (!codec) {
+        codec = avcodec_find_encoder_by_name(config->codec);
+        if (!codec) {
+            codec = avcodec_find_encoder(AV_CODEC_ID_H264);
+        }
+    }
 
     if (!codec) {
-        codec = avcodec_find_encoder(AV_CODEC_ID_H264);
+        fprintf(stderr, "Encoder not found\n");
+        return false;
     }
 
     ctx->video_stream = avformat_new_stream(ctx->fmt_ctx, codec);
     if (!ctx->video_stream) {
-        fprintf(stderr, "Failed to create video stream\n");
+        fprintf(stderr, "Failed to create output video stream\n");
         return false;
     }
 
     ctx->codec_ctx = avcodec_alloc_context3(codec);
     if (!ctx->codec_ctx) {
-        fprintf(stderr, "Failed to allocate codec context\n");
+        fprintf(stderr, "Failed to allocate encoder context\n");
         return false;
     }
 
     ctx->codec_ctx->width = width;
     ctx->codec_ctx->height = height;
-    ctx->codec_ctx->time_base = (AVRational){ 1, (int)fps };
-    ctx->codec_ctx->framerate = (AVRational){ (int)fps, 1 };
-    ctx->codec_ctx->gop_size = (int)fps;
+    ctx->codec_ctx->time_base = av_d2q(1.0 / fps, 1000000);
+    ctx->codec_ctx->framerate = av_d2q(fps, 1000000);
+    ctx->codec_ctx->gop_size = (int)(fps * 2);
     ctx->codec_ctx->max_b_frames = 2;
-    ctx->codec_ctx->pix_fmt = AV_PIX_FMT_YUV420P;
+    ctx->codec_ctx->pix_fmt = get_pixel_format(config->pixel_format);
 
-    if (config->gpu_encoding && ctx->hw_device_ctx) {
-        ctx->codec_ctx->hw_device_ctx = av_buffer_ref(ctx->hw_device_ctx);
+    if (config->gpu_encoding && g_input_ctx && g_input_ctx->hw_device_ctx) {
+        ctx->codec_ctx->hw_device_ctx = av_buffer_ref(g_input_ctx->hw_device_ctx);
     }
 
     if (config->bitrate > 0) {
         ctx->codec_ctx->bit_rate = config->bitrate * 1000;
+        ctx->codec_ctx->rc_max_rate = config->bitrate * 1200;
+        ctx->codec_ctx->rc_buffer_size = config->bitrate * 2000;
     }
     else {
-        av_opt_set_int(ctx->codec_ctx->priv_data, "crf", config->quality, 0);
+        if (codec->id == AV_CODEC_ID_H264 || codec->id == AV_CODEC_ID_HEVC) {
+            av_opt_set_int(ctx->codec_ctx->priv_data, "crf", config->quality, 0);
+        }
+        else {
+            ctx->codec_ctx->qmin = config->quality;
+            ctx->codec_ctx->qmax = config->quality + 10;
+        }
     }
 
     if (config->threads > 0) {
@@ -456,21 +638,28 @@ static bool create_output_video(VideoContext* ctx, const char* filename, const B
         ctx->codec_ctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
     }
 
+    if (config->gpu_encoding) {
+        av_opt_set(ctx->codec_ctx->priv_data, "preset", "fast", 0);
+        av_opt_set(ctx->codec_ctx->priv_data, "tune", "zerolatency", 0);
+    }
+
     ret = avcodec_open2(ctx->codec_ctx, codec, NULL);
     if (ret < 0) {
-        fprintf(stderr, "Failed to open encoder\n");
+        char errbuf[AV_ERROR_MAX_STRING_SIZE];
+        av_strerror(ret, errbuf, AV_ERROR_MAX_STRING_SIZE);
+        fprintf(stderr, "Failed to open encoder: %s\n", errbuf);
         return false;
     }
 
     ret = avcodec_parameters_from_context(ctx->video_stream->codecpar, ctx->codec_ctx);
     if (ret < 0) {
-        fprintf(stderr, "Failed to copy codec parameters\n");
+        fprintf(stderr, "Failed to copy encoder parameters to stream\n");
         return false;
     }
 
     ctx->video_stream->time_base = ctx->codec_ctx->time_base;
 
-    if (g_input_ctx->audio_stream_idx >= 0) {
+    if (g_input_ctx && g_input_ctx->audio_stream_idx >= 0) {
         AVStream* in_stream = g_input_ctx->fmt_ctx->streams[g_input_ctx->audio_stream_idx];
         AVStream* out_stream = avformat_new_stream(ctx->fmt_ctx, NULL);
 
@@ -478,21 +667,31 @@ static bool create_output_video(VideoContext* ctx, const char* filename, const B
             ret = avcodec_parameters_copy(out_stream->codecpar, in_stream->codecpar);
             if (ret >= 0) {
                 out_stream->time_base = in_stream->time_base;
+                if (config->timescale != 1.0) {
+                    out_stream->time_base.den = (int)(out_stream->time_base.den * config->timescale);
+                }
                 ctx->audio_stream = out_stream;
                 ctx->audio_stream_idx = out_stream->index;
+                if (config->verbose) {
+                    printf("Copying audio stream\n");
+                }
             }
         }
     }
 
     ret = avio_open(&ctx->fmt_ctx->pb, filename, AVIO_FLAG_WRITE);
     if (ret < 0) {
-        fprintf(stderr, "Failed to open output file\n");
+        char errbuf[AV_ERROR_MAX_STRING_SIZE];
+        av_strerror(ret, errbuf, AV_ERROR_MAX_STRING_SIZE);
+        fprintf(stderr, "Failed to open output file '%s': %s\n", filename, errbuf);
         return false;
     }
 
     ret = avformat_write_header(ctx->fmt_ctx, NULL);
     if (ret < 0) {
-        fprintf(stderr, "Failed to write header\n");
+        char errbuf[AV_ERROR_MAX_STRING_SIZE];
+        av_strerror(ret, errbuf, AV_ERROR_MAX_STRING_SIZE);
+        fprintf(stderr, "Failed to write output header: %s\n", errbuf);
         return false;
     }
 
@@ -502,15 +701,15 @@ static bool create_output_video(VideoContext* ctx, const char* filename, const B
     return true;
 }
 
+#ifdef HAVE_VAPOURSYNTH
 static bool init_vapoursynth(VapourSynthContext* vs_ctx) {
 #ifdef _WIN32
-    vs_ctx->library = LoadLibrary("vapoursynth.dll");
+    vs_ctx->library = LoadLibrary(L"vapoursynth.dll");
 #else
     vs_ctx->library = dlopen("libvapoursynth.so", RTLD_LAZY);
 #endif
 
     if (!vs_ctx->library) {
-        fprintf(stderr, "Failed to load VapourSynth library\n");
         return false;
     }
 
@@ -524,185 +723,45 @@ static bool init_vapoursynth(VapourSynthContext* vs_ctx) {
 #endif
 
     if (!getVapourSynthAPI) {
-        fprintf(stderr, "Failed to get VapourSynth API function\n");
         return false;
     }
 
     vs_ctx->vsapi = getVapourSynthAPI(VAPOURSYNTH_API_VERSION);
     if (!vs_ctx->vsapi) {
-        fprintf(stderr, "Failed to get VapourSynth API\n");
         return false;
     }
 
     vs_ctx->core = vs_ctx->vsapi->createCore(0);
     if (!vs_ctx->core) {
-        fprintf(stderr, "Failed to create VapourSynth core\n");
         return false;
     }
 
     return true;
 }
-
-static char* generate_vapoursynth_script(const BlurConfig* config, int width, int height, double fps) {
-    static char script[8192];
-    char interpolated_fps_str[32];
-    double target_fps = fps;
-
-    if (config->interpolate) {
-        if (strchr(config->interpolated_fps, 'x')) {
-            double multiplier = atof(config->interpolated_fps);
-            target_fps = fps * multiplier;
-        }
-        else {
-            target_fps = atof(config->interpolated_fps);
-        }
-    }
-
-    snprintf(interpolated_fps_str, sizeof(interpolated_fps_str), "%.2f", target_fps);
-
-    snprintf(script, sizeof(script),
-        "import vapoursynth as vs\n"
-        "core = vs.get_core()\n"
-        "clip = core.std.BlankClip(width=%d, height=%d, format=vs.YUV420P8, length=100000, fpsnum=%d, fpsden=1)\n",
-        width, height, (int)fps);
-
-    if (config->deduplicate) {
-        strcat(script, "clip = core.dedupe.DeDupe(clip, threshold=");
-        char threshold_str[32];
-        snprintf(threshold_str, sizeof(threshold_str), "%.2f", config->deduplicate_threshold);
-        strcat(script, threshold_str);
-        strcat(script, ", range=");
-        char range_str[32];
-        snprintf(range_str, sizeof(range_str), "%d", config->deduplicate_range);
-        strcat(script, range_str);
-        strcat(script, ")\n");
-    }
-
-    if (config->interpolate) {
-        if (strcmp(config->interpolation_method, "svp") == 0) {
-            strcat(script, "import sys\n");
-            strcat(script, "sys.path.append(r'C:\\Program Files (x86)\\SVP 4\\plugins64')\n");
-            strcat(script, "import vapoursynth as vs\n");
-            strcat(script, "core = vs.get_core(threads=");
-            char threads_str[32];
-            snprintf(threads_str, sizeof(threads_str), "%d", config->threads > 0 ? config->threads : 1);
-            strcat(script, threads_str);
-            strcat(script, ")\n");
-
-            strcat(script, "clip = core.svp1.Super(clip, ");
-            if (config->manual_svp && strlen(config->svp_super_string) > 0) {
-                strcat(script, config->svp_super_string);
-            }
-            else {
-                strcat(script, "{pel:2,gpu:1}");
-            }
-            strcat(script, ")\n");
-
-            strcat(script, "vectors = core.svp1.Analyse(clip, ");
-            if (config->manual_svp && strlen(config->svp_vectors_string) > 0) {
-                strcat(script, config->svp_vectors_string);
-            }
-            else {
-                strcat(script, "{block:{w:");
-                char block_str[32];
-                snprintf(block_str, sizeof(block_str), "%d", config->interpolation_block_size);
-                strcat(script, block_str);
-                strcat(script, ",h:");
-                strcat(script, block_str);
-                strcat(script, "}}");
-            }
-            strcat(script, ")\n");
-
-            strcat(script, "clip = core.svp2.SmoothFps(clip, clip, vectors, ");
-            if (config->manual_svp && strlen(config->svp_smooth_string) > 0) {
-                strcat(script, config->svp_smooth_string);
-            }
-            else {
-                strcat(script, "{rate:{num:");
-                strcat(script, interpolated_fps_str);
-                strcat(script, ",den:1},algo:");
-                char algo_str[32];
-                snprintf(algo_str, sizeof(algo_str), "%d", config->svp_algorithm);
-                strcat(script, algo_str);
-                strcat(script, ",mask:{area:");
-                char mask_str[32];
-                snprintf(mask_str, sizeof(mask_str), "%.0f", config->interpolation_mask_area * 100);
-                strcat(script, mask_str);
-                strcat(script, "}}");
-            }
-            strcat(script, ")\n");
-        }
-        else if (strcmp(config->interpolation_method, "rife") == 0) {
-            strcat(script, "clip = core.rife.RIFE(clip, factor=");
-            char factor_str[32];
-            snprintf(factor_str, sizeof(factor_str), "%.1f", target_fps / fps);
-            strcat(script, factor_str);
-            if (config->gpu_interpolation) {
-                strcat(script, ", gpu_id=0");
-            }
-            strcat(script, ")\n");
-        }
-    }
-
-    if (config->brightness != 0 || config->saturation != 0 ||
-        config->contrast != 0 || config->gamma != 1.0) {
-        strcat(script, "clip = core.std.Levels(clip, ");
-
-        int min_in = 0, max_in = 255;
-        int min_out = 0, max_out = 255;
-
-        if (config->brightness != 0) {
-            int brightness_offset = (int)(config->brightness * 255);
-            min_out = CLAMP(min_out + brightness_offset, 0, 255);
-            max_out = CLAMP(max_out + brightness_offset, 0, 255);
-        }
-
-        if (config->contrast != 0) {
-            float contrast_factor = 1.0f + config->contrast;
-            int mid = 128;
-            min_in = CLAMP((int)(mid - (mid - min_in) * contrast_factor), 0, 255);
-            max_in = CLAMP((int)(mid + (max_in - mid) * contrast_factor), 0, 255);
-        }
-
-        char levels_str[256];
-        snprintf(levels_str, sizeof(levels_str),
-            "min_in=%d, max_in=%d, min_out=%d, max_out=%d, gamma=%.2f",
-            min_in, max_in, min_out, max_out, config->gamma);
-        strcat(script, levels_str);
-        strcat(script, ")\n");
-    }
-
-    if (config->timescale != 1.0) {
-        strcat(script, "clip = core.std.AssumeFPS(clip, fpsnum=");
-        char scaled_fps_str[32];
-        snprintf(scaled_fps_str, sizeof(scaled_fps_str), "%d", (int)(fps * config->timescale));
-        strcat(script, scaled_fps_str);
-        strcat(script, ", fpsden=1)\n");
-    }
-
-    strcat(script, "clip.set_output()\n");
-
-    return script;
-}
+#endif
 
 static bool create_filter_graph(const BlurConfig* config, int width, int height, double fps) {
     int ret;
-    char filter_str[2048];
+    char args[512];
 
     g_filter_graph = avfilter_graph_alloc();
     if (!g_filter_graph) {
         return false;
     }
 
-    snprintf(filter_str, sizeof(filter_str),
-        "video_size=%dx%d:pix_fmt=%d:time_base=1/%d:pixel_aspect=1/1",
-        width, height, AV_PIX_FMT_YUV420P, (int)fps);
+    if (config->threads > 0) {
+        g_filter_graph->nb_threads = config->threads;
+    }
+
+    snprintf(args, sizeof(args),
+        "video_size=%dx%d:pix_fmt=%d:time_base=%d/%d:pixel_aspect=1/1",
+        width, height, AV_PIX_FMT_YUV420P, 1, (int)fps);
 
     const AVFilter* buffersrc = avfilter_get_by_name("buffer");
     ret = avfilter_graph_create_filter(&g_buffersrc_ctx, buffersrc, "in",
-        filter_str, NULL, g_filter_graph);
+        args, NULL, g_filter_graph);
     if (ret < 0) {
-        fprintf(stderr, "Failed to create buffer source\n");
+        fprintf(stderr, "Failed to create buffer source filter\n");
         return false;
     }
 
@@ -710,7 +769,15 @@ static bool create_filter_graph(const BlurConfig* config, int width, int height,
     ret = avfilter_graph_create_filter(&g_buffersink_ctx, buffersink, "out",
         NULL, NULL, g_filter_graph);
     if (ret < 0) {
-        fprintf(stderr, "Failed to create buffer sink\n");
+        fprintf(stderr, "Failed to create buffer sink filter\n");
+        return false;
+    }
+
+    enum AVPixelFormat pix_fmts[] = { AV_PIX_FMT_YUV420P, AV_PIX_FMT_NONE };
+    ret = av_opt_set_int_list(g_buffersink_ctx, "pix_fmts", pix_fmts,
+        AV_PIX_FMT_NONE, AV_OPT_SEARCH_CHILDREN);
+    if (ret < 0) {
+        fprintf(stderr, "Failed to set pixel formats on buffer sink\n");
         return false;
     }
 
@@ -727,16 +794,29 @@ static bool create_filter_graph(const BlurConfig* config, int width, int height,
     inputs->pad_idx = 0;
     inputs->next = NULL;
 
-    filter_str[0] = '\0';
+    char filter_descr[2048] = "null";
 
     if (strlen(config->ffmpeg_filters) > 0) {
-        strcat(filter_str, config->ffmpeg_filters);
+        strncpy(filter_descr, config->ffmpeg_filters, sizeof(filter_descr) - 1);
     }
-    else {
-        strcat(filter_str, "null");
+    else if (config->brightness != 0 || config->saturation != 0 ||
+        config->contrast != 0 || config->gamma != 1.0) {
+
+        float bright = config->brightness;
+        float sat = 1.0f + config->saturation;
+        float cont = 1.0f + config->contrast;
+        float gamma = config->gamma;
+
+        snprintf(filter_descr, sizeof(filter_descr),
+            "eq=brightness=%.2f:saturation=%.2f:contrast=%.2f:gamma=%.2f",
+            bright, sat, cont, gamma);
     }
 
-    ret = avfilter_graph_parse_ptr(g_filter_graph, filter_str, &inputs, &outputs, NULL);
+    if (config->debug) {
+        printf("Filter description: %s\n", filter_descr);
+    }
+
+    ret = avfilter_graph_parse_ptr(g_filter_graph, filter_descr, &inputs, &outputs, NULL);
     if (ret < 0) {
         fprintf(stderr, "Failed to parse filter graph\n");
         avfilter_inout_free(&inputs);
@@ -756,225 +836,328 @@ static bool create_filter_graph(const BlurConfig* config, int width, int height,
     return true;
 }
 
-static bool apply_motion_blur(AVFrame** frames, int frame_count, float* weights, AVFrame* output) {
-    if (frame_count == 0) return false;
+static bool apply_motion_blur(FrameBuffer* frames, int frame_count, float* weights, FrameBuffer* output) {
+    if (frame_count == 0 || !frames || !weights || !output) return false;
 
-    int width = frames[0]->width;
-    int height = frames[0]->height;
+    int width = frames[0].width;
+    int height = frames[0].height;
+
+    if (!output->allocated) {
+        if (!frame_buffer_alloc(output, width, height, AV_PIX_FMT_YUV420P)) {
+            return false;
+        }
+    }
+
+    memset(output->data[0], 0, output->linesize[0] * height);
+    memset(output->data[1], 0, output->linesize[1] * (height / 2));
+    memset(output->data[2], 0, output->linesize[2] * (height / 2));
 
     for (int y = 0; y < height; y++) {
         for (int x = 0; x < width; x++) {
-            float y_sum = 0, u_sum = 0, v_sum = 0;
+            float y_accum = 0, u_accum = 0, v_accum = 0;
 
             for (int i = 0; i < frame_count; i++) {
-                if (!frames[i]) continue;
+                if (!frames[i].data[0]) continue;
 
-                uint8_t y_val = frames[i]->data[0][y * frames[i]->linesize[0] + x];
-                uint8_t u_val = frames[i]->data[1][(y / 2) * frames[i]->linesize[1] + (x / 2)];
-                uint8_t v_val = frames[i]->data[2][(y / 2) * frames[i]->linesize[2] + (x / 2)];
+                uint8_t y_val = frames[i].data[0][y * frames[i].linesize[0] + x];
+                y_accum += y_val * weights[i];
 
-                y_sum += y_val * weights[i];
-                u_sum += u_val * weights[i];
-                v_sum += v_val * weights[i];
+                if (y % 2 == 0 && x % 2 == 0) {
+                    uint8_t u_val = frames[i].data[1][(y / 2) * frames[i].linesize[1] + (x / 2)];
+                    uint8_t v_val = frames[i].data[2][(y / 2) * frames[i].linesize[2] + (x / 2)];
+                    u_accum += u_val * weights[i];
+                    v_accum += v_val * weights[i];
+                }
             }
 
-            output->data[0][y * output->linesize[0] + x] = (uint8_t)CLAMP(y_sum, 0, 255);
+            output->data[0][y * output->linesize[0] + x] = (uint8_t)CLAMP(y_accum, 0, 255);
+
             if (y % 2 == 0 && x % 2 == 0) {
-                output->data[1][(y / 2) * output->linesize[1] + (x / 2)] = (uint8_t)CLAMP(u_sum, 0, 255);
-                output->data[2][(y / 2) * output->linesize[2] + (x / 2)] = (uint8_t)CLAMP(v_sum, 0, 255);
+                output->data[1][(y / 2) * output->linesize[1] + (x / 2)] = (uint8_t)CLAMP(u_accum, 0, 255);
+                output->data[2][(y / 2) * output->linesize[2] + (x / 2)] = (uint8_t)CLAMP(v_accum, 0, 255);
             }
         }
     }
 
+    output->pts = frames[frame_count / 2].pts;
     return true;
 }
 
-static bool detect_duplicate_frames(AVFrame* frame1, AVFrame* frame2, float threshold) {
-    if (!frame1 || !frame2) return false;
+static bool detect_duplicate_frames(FrameBuffer* frame1, FrameBuffer* frame2, float threshold) {
+    if (!frame1 || !frame2 || !frame1->data[0] || !frame2->data[0]) return false;
 
     int width = frame1->width;
     int height = frame1->height;
-    int total_pixels = width * height;
+
+    if (width != frame2->width || height != frame2->height) return false;
 
     int64_t diff_sum = 0;
+    int total_pixels = width * height;
 
     for (int y = 0; y < height; y++) {
         for (int x = 0; x < width; x++) {
-            int diff = abs(frame1->data[0][y * frame1->linesize[0] + x] -
-                frame2->data[0][y * frame2->linesize[0] + x]);
-            diff_sum += diff;
+            int val1 = frame1->data[0][y * frame1->linesize[0] + x];
+            int val2 = frame2->data[0][y * frame2->linesize[0] + x];
+            diff_sum += abs(val1 - val2);
         }
     }
 
     float avg_diff = (float)diff_sum / total_pixels;
-    return avg_diff < threshold * 255;
+    return avg_diff < (threshold * 255.0f);
 }
 
-static void* processing_thread(void* arg) {
+static double parse_fps_string(const char* fps_str, double base_fps) {
+    if (strstr(fps_str, "x")) {
+        double multiplier = atof(fps_str);
+        return base_fps * multiplier;
+    }
+    return atof(fps_str);
+}
+
+static THREAD_FUNC processing_thread(void* arg) {
     BlurConfig* config = (BlurConfig*)arg;
-    AVFrame** blur_frames = NULL;
-    int blur_frame_count = 0;
+    BlurFrameBuffer blur_buffer = { 0 };
     int weight_count = 0;
     float* weights = NULL;
 
     double input_fps = av_q2d(g_input_ctx->video_stream->avg_frame_rate);
-    double output_fps = input_fps;
+    double output_fps = parse_fps_string(config->blur_output_fps, input_fps);
 
-    if (strchr(config->blur_output_fps, 'x')) {
-        double multiplier = atof(config->blur_output_fps);
-        output_fps = input_fps * multiplier;
-    }
-    else {
-        output_fps = atof(config->blur_output_fps);
-    }
-
-    blur_frame_count = (int)(output_fps / input_fps * config->blur_amount + 0.5);
+    int blur_frame_count = (int)(output_fps / input_fps * config->blur_amount * 5.0 + 0.5);
     if (blur_frame_count < 1) blur_frame_count = 1;
+    if (blur_frame_count > 64) blur_frame_count = 64;
 
     weights = config_get_weights(config, blur_frame_count, &weight_count);
     if (!weights) {
-        fprintf(stderr, "Failed to generate weights\n");
+        fprintf(stderr, "Failed to generate blur weights\n");
+#ifdef _WIN32
+        return 1;
+#else
         return NULL;
+#endif
     }
 
-    blur_frames = (AVFrame**)calloc(blur_frame_count, sizeof(AVFrame*));
-    if (!blur_frames) {
+    blur_buffer.capacity = blur_frame_count;
+    blur_buffer.buffer = (FrameBuffer*)calloc(blur_frame_count, sizeof(FrameBuffer));
+    blur_buffer.count = 0;
+    blur_buffer.current_pos = 0;
+
+    if (!blur_buffer.buffer) {
         free(weights);
+#ifdef _WIN32
+        return 1;
+#else
         return NULL;
+#endif
     }
 
-    for (int i = 0; i < blur_frame_count; i++) {
-        blur_frames[i] = av_frame_alloc();
-        if (!blur_frames[i]) {
-            for (int j = 0; j < i; j++) {
-                av_frame_free(&blur_frames[j]);
-            }
-            free(blur_frames);
-            free(weights);
-            return NULL;
-        }
-    }
-
-    int current_frame = 0;
+    FrameBuffer output_buffer = { 0 };
     AVFrame* output_frame = av_frame_alloc();
+    AVFrame* input_frame = av_frame_alloc();
+
+    int frames_processed = 0;
+    FrameBuffer dedup_frames[16] = { 0 };
+    int dedup_count = 0;
+
+    if (config->verbose) {
+        printf("Processing with %d blur frames, weights: ", blur_frame_count);
+        for (int i = 0; i < weight_count; i++) {
+            printf("%.3f ", weights[i]);
+        }
+        printf("\n");
+    }
 
     while (!is_interrupted()) {
-        AVFrame* input_frame = av_frame_alloc();
-
         if (!frame_queue_pop(g_frame_queue, input_frame)) {
-            av_frame_free(&input_frame);
             break;
         }
 
-        if (config->deduplicate && current_frame > 0) {
-            bool is_duplicate = false;
-            for (int i = 0; i < config->deduplicate_range && i < current_frame; i++) {
-                if (detect_duplicate_frames(input_frame, blur_frames[i], config->deduplicate_threshold)) {
+        bool is_duplicate = false;
+
+        if (config->deduplicate && dedup_count > 0) {
+            FrameBuffer temp_buffer = { 0 };
+            frame_buffer_copy(&temp_buffer, input_frame);
+
+            for (int i = 0; i < dedup_count && i < config->deduplicate_range; i++) {
+                if (detect_duplicate_frames(&temp_buffer, &dedup_frames[i], config->deduplicate_threshold)) {
                     is_duplicate = true;
                     break;
                 }
             }
 
-            if (is_duplicate) {
-                av_frame_free(&input_frame);
-                continue;
+            if (!is_duplicate && dedup_count < 16) {
+                if (dedup_frames[dedup_count].allocated) {
+                    for (int j = 0; j < 4; j++) {
+                        if (dedup_frames[dedup_count].data[j]) {
+                            av_free(dedup_frames[dedup_count].data[j]);
+                        }
+                    }
+                    av_free(dedup_frames[dedup_count].data);
+                    av_free(dedup_frames[dedup_count].linesize);
+                }
+                dedup_frames[dedup_count] = temp_buffer;
+                dedup_count++;
             }
         }
 
-        av_frame_unref(blur_frames[current_frame % blur_frame_count]);
-        av_frame_ref(blur_frames[current_frame % blur_frame_count], input_frame);
+        if (is_duplicate) {
+            av_frame_unref(input_frame);
+            continue;
+        }
 
-        if (current_frame >= blur_frame_count - 1) {
-            av_frame_unref(output_frame);
-            output_frame->format = AV_PIX_FMT_YUV420P;
-            output_frame->width = input_frame->width;
-            output_frame->height = input_frame->height;
-            av_frame_get_buffer(output_frame, 0);
+        FrameBuffer* current_buffer = &blur_buffer.buffer[blur_buffer.current_pos];
+        frame_buffer_copy(current_buffer, input_frame);
 
-            AVFrame** ordered_frames = (AVFrame**)calloc(blur_frame_count, sizeof(AVFrame*));
+        blur_buffer.current_pos = (blur_buffer.current_pos + 1) % blur_buffer.capacity;
+        if (blur_buffer.count < blur_buffer.capacity) {
+            blur_buffer.count++;
+        }
+
+        if (blur_buffer.count >= blur_frame_count) {
+            FrameBuffer* ordered_frames = (FrameBuffer*)malloc(blur_frame_count * sizeof(FrameBuffer));
+
             for (int i = 0; i < blur_frame_count; i++) {
-                int idx = (current_frame - blur_frame_count + 1 + i) % blur_frame_count;
-                if (idx < 0) idx += blur_frame_count;
-                ordered_frames[i] = blur_frames[idx];
+                int idx = (blur_buffer.current_pos - blur_frame_count + i + blur_buffer.capacity) % blur_buffer.capacity;
+                ordered_frames[i] = blur_buffer.buffer[idx];
             }
 
-            apply_motion_blur(ordered_frames, blur_frame_count, weights, output_frame);
-            free(ordered_frames);
+            if (apply_motion_blur(ordered_frames, blur_frame_count, weights, &output_buffer)) {
+                frame_buffer_to_avframe(&output_buffer, output_frame);
 
-            output_frame->pts = input_frame->pts;
-
-            int ret = avcodec_send_frame(g_output_ctx->codec_ctx, output_frame);
-            if (ret < 0) {
-                fprintf(stderr, "Error sending frame to encoder\n");
-            }
-
-            while (ret >= 0) {
-                ret = avcodec_receive_packet(g_output_ctx->codec_ctx, g_output_ctx->packet);
-                if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
-                    break;
-                }
-                else if (ret < 0) {
-                    fprintf(stderr, "Error receiving packet from encoder\n");
-                    break;
-                }
-
-                g_output_ctx->packet->stream_index = g_output_ctx->video_stream->index;
-                av_packet_rescale_ts(g_output_ctx->packet,
-                    g_output_ctx->codec_ctx->time_base,
-                    g_output_ctx->video_stream->time_base);
-
-                ret = av_interleaved_write_frame(g_output_ctx->fmt_ctx, g_output_ctx->packet);
+                int ret = avcodec_send_frame(g_output_ctx->codec_ctx, output_frame);
                 if (ret < 0) {
-                    fprintf(stderr, "Error writing frame\n");
+                    if (config->debug) {
+                        fprintf(stderr, "Error sending frame to encoder: %d\n", ret);
+                    }
                 }
 
-                av_packet_unref(g_output_ctx->packet);
+                while (ret >= 0) {
+                    ret = avcodec_receive_packet(g_output_ctx->codec_ctx, g_output_ctx->packet);
+                    if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+                        break;
+                    }
+                    else if (ret < 0) {
+                        if (config->debug) {
+                            fprintf(stderr, "Error receiving packet from encoder: %d\n", ret);
+                        }
+                        break;
+                    }
+
+                    g_output_ctx->packet->stream_index = g_output_ctx->video_stream->index;
+                    av_packet_rescale_ts(g_output_ctx->packet,
+                        g_output_ctx->codec_ctx->time_base,
+                        g_output_ctx->video_stream->time_base);
+
+                    ret = av_interleaved_write_frame(g_output_ctx->fmt_ctx, g_output_ctx->packet);
+                    if (ret < 0) {
+                        if (config->debug) {
+                            fprintf(stderr, "Error writing packet: %d\n", ret);
+                        }
+                    }
+
+                    av_packet_unref(g_output_ctx->packet);
+                }
+            }
+
+            free(ordered_frames);
+        }
+
+        frames_processed++;
+        if (frames_processed % 30 == 0) {
+            update_progress(frames_processed);
+        }
+
+        av_frame_unref(input_frame);
+    }
+
+    avcodec_send_frame(g_output_ctx->codec_ctx, NULL);
+    while (true) {
+        int ret = avcodec_receive_packet(g_output_ctx->codec_ctx, g_output_ctx->packet);
+        if (ret == AVERROR_EOF) {
+            break;
+        }
+        else if (ret < 0) {
+            break;
+        }
+
+        g_output_ctx->packet->stream_index = g_output_ctx->video_stream->index;
+        av_packet_rescale_ts(g_output_ctx->packet,
+            g_output_ctx->codec_ctx->time_base,
+            g_output_ctx->video_stream->time_base);
+
+        av_interleaved_write_frame(g_output_ctx->fmt_ctx, g_output_ctx->packet);
+        av_packet_unref(g_output_ctx->packet);
+    }
+
+    if (output_buffer.allocated && output_buffer.data) {
+        for (int i = 0; i < 4; i++) {
+            if (output_buffer.data[i]) {
+                av_free(output_buffer.data[i]);
             }
         }
+        av_free(output_buffer.data);
+        av_free(output_buffer.linesize);
+    }
 
-        current_frame++;
-        av_frame_free(&input_frame);
-
-        if (current_frame % 10 == 0) {
-            update_progress(current_frame);
+    for (int i = 0; i < blur_buffer.capacity; i++) {
+        if (blur_buffer.buffer[i].allocated && blur_buffer.buffer[i].data) {
+            for (int j = 0; j < 4; j++) {
+                if (blur_buffer.buffer[i].data[j]) {
+                    av_free(blur_buffer.buffer[i].data[j]);
+                }
+            }
+            av_free(blur_buffer.buffer[i].data);
+            av_free(blur_buffer.buffer[i].linesize);
         }
     }
 
-    av_frame_free(&output_frame);
-
-    for (int i = 0; i < blur_frame_count; i++) {
-        av_frame_free(&blur_frames[i]);
+    for (int i = 0; i < dedup_count; i++) {
+        if (dedup_frames[i].allocated && dedup_frames[i].data) {
+            for (int j = 0; j < 4; j++) {
+                if (dedup_frames[i].data[j]) {
+                    av_free(dedup_frames[i].data[j]);
+                }
+            }
+            av_free(dedup_frames[i].data);
+            av_free(dedup_frames[i].linesize);
+        }
     }
-    free(blur_frames);
-    free(weights);
 
+    free(blur_buffer.buffer);
+    free(weights);
+    av_frame_free(&output_frame);
+    av_frame_free(&input_frame);
+
+    if (config->verbose) {
+        printf("Processing thread finished, processed %d frames\n", frames_processed);
+    }
+
+#ifdef _WIN32
+    return 0;
+#else
     return NULL;
+#endif
 }
 
 bool video_process(const BlurConfig* config) {
     int width = g_input_ctx->codec_ctx->width;
     int height = g_input_ctx->codec_ctx->height;
-    double fps = av_q2d(g_input_ctx->video_stream->avg_frame_rate);
-
-    double output_fps = fps;
-    if (strchr(config->blur_output_fps, 'x')) {
-        double multiplier = atof(config->blur_output_fps);
-        output_fps = fps * multiplier;
-    }
-    else {
-        output_fps = atof(config->blur_output_fps);
-    }
+    double input_fps = av_q2d(g_input_ctx->video_stream->avg_frame_rate);
+    double output_fps = parse_fps_string(config->blur_output_fps, input_fps);
 
     if (config->timescale != 1.0) {
         output_fps *= config->timescale;
     }
 
+    printf("Processing %dx%d video: %.2f fps -> %.2f fps\n", width, height, input_fps, output_fps);
+
     g_output_ctx = (VideoContext*)calloc(1, sizeof(VideoContext));
     if (!g_output_ctx) {
+        fprintf(stderr, "Failed to allocate output context\n");
         return false;
     }
 
-    if (config->gpu_encoding) {
+    if (config->gpu_encoding && g_input_ctx->hw_device_ctx) {
         g_output_ctx->hw_device_ctx = g_input_ctx->hw_device_ctx;
     }
 
@@ -982,42 +1165,64 @@ bool video_process(const BlurConfig* config) {
         return false;
     }
 
-    if (config->interpolate) {
-        g_vs_ctx = (VapourSynthContext*)calloc(1, sizeof(VapourSynthContext));
-        if (!init_vapoursynth(g_vs_ctx)) {
-            fprintf(stderr, "Warning: VapourSynth initialization failed, continuing without interpolation\n");
-            free(g_vs_ctx);
-            g_vs_ctx = NULL;
-        }
-    }
-
     if (strlen(config->ffmpeg_filters) > 0 || config->brightness != 0 ||
         config->saturation != 0 || config->contrast != 0 || config->gamma != 1.0) {
-        if (!create_filter_graph(config, width, height, fps)) {
-            fprintf(stderr, "Warning: Filter graph creation failed\n");
+        if (!create_filter_graph(config, width, height, input_fps)) {
+            fprintf(stderr, "Warning: Filter graph creation failed, continuing without filters\n");
         }
     }
 
     g_frame_queue = (FrameQueue*)calloc(1, sizeof(FrameQueue));
-    frame_queue_init(g_frame_queue, 100);
+    if (!g_frame_queue) {
+        fprintf(stderr, "Failed to allocate frame queue\n");
+        return false;
+    }
 
+    frame_queue_init(g_frame_queue, 200);
+
+#ifdef _WIN32
+    HANDLE processing_tid = CreateThread(NULL, 0, processing_thread, (void*)config, 0, NULL);
+    if (!processing_tid) {
+        fprintf(stderr, "Failed to create processing thread\n");
+        return false;
+    }
+#else
     pthread_t processing_tid;
-    pthread_create(&processing_tid, NULL, processing_thread, (void*)config);
+    if (pthread_create(&processing_tid, NULL, processing_thread, (void*)config) != 0) {
+        fprintf(stderr, "Failed to create processing thread\n");
+        return false;
+    }
+#endif
 
     AVFrame* decoded_frame = av_frame_alloc();
-    AVFrame* processed_frame = av_frame_alloc();
+    AVFrame* filtered_frame = av_frame_alloc();
+    int64_t frames_read = 0;
     int ret;
+
+    if (config->verbose) {
+        printf("Starting frame reading and decoding...\n");
+    }
 
     while (!is_interrupted()) {
         ret = av_read_frame(g_input_ctx->fmt_ctx, g_input_ctx->packet);
         if (ret < 0) {
+            if (ret == AVERROR_EOF) {
+                if (config->verbose) {
+                    printf("Reached end of input file\n");
+                }
+            }
+            else {
+                fprintf(stderr, "Error reading frame: %d\n", ret);
+            }
             break;
         }
 
         if (g_input_ctx->packet->stream_index == g_input_ctx->video_stream_idx) {
             ret = avcodec_send_packet(g_input_ctx->codec_ctx, g_input_ctx->packet);
             if (ret < 0) {
-                fprintf(stderr, "Error sending packet to decoder\n");
+                if (config->debug) {
+                    fprintf(stderr, "Error sending packet to decoder: %d\n", ret);
+                }
                 av_packet_unref(g_input_ctx->packet);
                 continue;
             }
@@ -1028,33 +1233,49 @@ bool video_process(const BlurConfig* config) {
                     break;
                 }
                 else if (ret < 0) {
-                    fprintf(stderr, "Error receiving frame from decoder\n");
+                    if (config->debug) {
+                        fprintf(stderr, "Error receiving frame from decoder: %d\n", ret);
+                    }
                     break;
                 }
 
                 if (g_filter_graph) {
-                    ret = av_buffersrc_add_frame_flags(g_buffersrc_ctx, decoded_frame, 0);
+                    ret = av_buffersrc_add_frame_flags(g_buffersrc_ctx, decoded_frame, AV_BUFFERSRC_FLAG_KEEP_REF);
                     if (ret < 0) {
-                        fprintf(stderr, "Error feeding filter graph\n");
+                        if (config->debug) {
+                            fprintf(stderr, "Error feeding frame to filter graph: %d\n", ret);
+                        }
                         continue;
                     }
 
-                    while (1) {
-                        ret = av_buffersink_get_frame(g_buffersink_ctx, processed_frame);
+                    while (true) {
+                        ret = av_buffersink_get_frame(g_buffersink_ctx, filtered_frame);
                         if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
                             break;
                         }
                         else if (ret < 0) {
-                            fprintf(stderr, "Error getting frame from filter\n");
+                            if (config->debug) {
+                                fprintf(stderr, "Error getting frame from filter: %d\n", ret);
+                            }
                             break;
                         }
 
-                        frame_queue_push(g_frame_queue, processed_frame);
-                        av_frame_unref(processed_frame);
+                        if (!frame_queue_push(g_frame_queue, filtered_frame)) {
+                            av_frame_unref(filtered_frame);
+                            break;
+                        }
+                        av_frame_unref(filtered_frame);
                     }
                 }
                 else {
-                    frame_queue_push(g_frame_queue, decoded_frame);
+                    if (!frame_queue_push(g_frame_queue, decoded_frame)) {
+                        break;
+                    }
+                }
+
+                frames_read++;
+                if (frames_read % 100 == 0 && config->verbose) {
+                    printf("Read %lld frames\n", (long long)frames_read);
                 }
 
                 av_frame_unref(decoded_frame);
@@ -1062,20 +1283,26 @@ bool video_process(const BlurConfig* config) {
         }
         else if (g_output_ctx->audio_stream_idx >= 0 &&
             g_input_ctx->packet->stream_index == g_input_ctx->audio_stream_idx) {
-            g_input_ctx->packet->stream_index = g_output_ctx->audio_stream_idx;
-            av_packet_rescale_ts(g_input_ctx->packet,
-                g_input_ctx->audio_stream->time_base,
-                g_output_ctx->audio_stream->time_base);
 
-            if (config->timescale != 1.0) {
-                g_input_ctx->packet->pts = (int64_t)(g_input_ctx->packet->pts / config->timescale);
-                g_input_ctx->packet->dts = (int64_t)(g_input_ctx->packet->dts / config->timescale);
-                g_input_ctx->packet->duration = (int64_t)(g_input_ctx->packet->duration / config->timescale);
-            }
+            AVPacket* audio_pkt = av_packet_clone(g_input_ctx->packet);
+            if (audio_pkt) {
+                audio_pkt->stream_index = g_output_ctx->audio_stream_idx;
+                av_packet_rescale_ts(audio_pkt,
+                    g_input_ctx->audio_stream->time_base,
+                    g_output_ctx->audio_stream->time_base);
 
-            ret = av_interleaved_write_frame(g_output_ctx->fmt_ctx, g_input_ctx->packet);
-            if (ret < 0) {
-                fprintf(stderr, "Error writing audio packet\n");
+                if (config->timescale != 1.0 && !config->pitch_correction) {
+                    audio_pkt->pts = (int64_t)(audio_pkt->pts / config->timescale);
+                    audio_pkt->dts = (int64_t)(audio_pkt->dts / config->timescale);
+                    audio_pkt->duration = (int64_t)(audio_pkt->duration / config->timescale);
+                }
+
+                ret = av_interleaved_write_frame(g_output_ctx->fmt_ctx, audio_pkt);
+                if (ret < 0 && config->debug) {
+                    fprintf(stderr, "Error writing audio packet: %d\n", ret);
+                }
+
+                av_packet_free(&audio_pkt);
             }
         }
 
@@ -1084,40 +1311,40 @@ bool video_process(const BlurConfig* config) {
 
     avcodec_send_packet(g_input_ctx->codec_ctx, NULL);
     while (avcodec_receive_frame(g_input_ctx->codec_ctx, decoded_frame) >= 0) {
-        frame_queue_push(g_frame_queue, decoded_frame);
+        if (g_filter_graph) {
+            av_buffersrc_add_frame_flags(g_buffersrc_ctx, decoded_frame, AV_BUFFERSRC_FLAG_KEEP_REF);
+            while (av_buffersink_get_frame(g_buffersink_ctx, filtered_frame) >= 0) {
+                frame_queue_push(g_frame_queue, filtered_frame);
+                av_frame_unref(filtered_frame);
+            }
+        }
+        else {
+            frame_queue_push(g_frame_queue, decoded_frame);
+        }
         av_frame_unref(decoded_frame);
     }
 
-    pthread_mutex_lock(&g_frame_queue->mutex);
-    pthread_cond_broadcast(&g_frame_queue->not_empty);
-    pthread_mutex_unlock(&g_frame_queue->mutex);
+    frame_queue_signal_finished(g_frame_queue);
 
-    pthread_join(processing_tid, NULL);
-
-    avcodec_send_frame(g_output_ctx->codec_ctx, NULL);
-    while (1) {
-        ret = avcodec_receive_packet(g_output_ctx->codec_ctx, g_output_ctx->packet);
-        if (ret == AVERROR_EOF) {
-            break;
-        }
-        else if (ret < 0) {
-            fprintf(stderr, "Error receiving final packets\n");
-            break;
-        }
-
-        g_output_ctx->packet->stream_index = g_output_ctx->video_stream->index;
-        av_packet_rescale_ts(g_output_ctx->packet,
-            g_output_ctx->codec_ctx->time_base,
-            g_output_ctx->video_stream->time_base);
-
-        ret = av_interleaved_write_frame(g_output_ctx->fmt_ctx, g_output_ctx->packet);
-        av_packet_unref(g_output_ctx->packet);
+    if (config->verbose) {
+        printf("Waiting for processing to complete...\n");
     }
+
+#ifdef _WIN32
+    WaitForSingleObject(processing_tid, INFINITE);
+    CloseHandle(processing_tid);
+#else
+    pthread_join(processing_tid, NULL);
+#endif
 
     av_write_trailer(g_output_ctx->fmt_ctx);
 
     av_frame_free(&decoded_frame);
-    av_frame_free(&processed_frame);
+    av_frame_free(&filtered_frame);
+
+    if (config->verbose) {
+        printf("Video processing completed\n");
+    }
 
     return !is_interrupted();
 }
@@ -1155,10 +1382,15 @@ bool video_get_info(const char* filename, int* width, int* height, double* fps, 
 
     *width = codecpar->width;
     *height = codecpar->height;
-    *fps = av_q2d(video_stream->avg_frame_rate);
-    *frame_count = video_stream->nb_frames;
 
-    if (*frame_count <= 0) {
+    AVRational frame_rate = video_stream->avg_frame_rate;
+    if (frame_rate.num == 0 || frame_rate.den == 0) {
+        frame_rate = av_guess_frame_rate(fmt_ctx, video_stream, NULL);
+    }
+    *fps = av_q2d(frame_rate);
+
+    *frame_count = video_stream->nb_frames;
+    if (*frame_count <= 0 && fmt_ctx->duration != AV_NOPTS_VALUE) {
         *frame_count = (int64_t)(fmt_ctx->duration * (*fps) / AV_TIME_BASE);
     }
 
@@ -1170,9 +1402,17 @@ bool video_get_info(const char* filename, int* width, int* height, double* fps, 
     }
 
     BlurConfig dummy_config = { 0 };
+    dummy_config.gpu_decoding = false;
+    dummy_config.threads = 1;
     strcpy(dummy_config.gpu_type, "nvidia");
 
-    return open_input_video(g_input_ctx, filename, &dummy_config);
+    bool result = open_input_video(g_input_ctx, filename, &dummy_config);
+    if (!result && g_input_ctx) {
+        free(g_input_ctx);
+        g_input_ctx = NULL;
+    }
+
+    return result;
 }
 
 void video_cleanup(void) {
@@ -1185,6 +1425,8 @@ void video_cleanup(void) {
     if (g_filter_graph) {
         avfilter_graph_free(&g_filter_graph);
         g_filter_graph = NULL;
+        g_buffersrc_ctx = NULL;
+        g_buffersink_ctx = NULL;
     }
 
     if (g_input_ctx) {
@@ -1210,6 +1452,7 @@ void video_cleanup(void) {
         g_output_ctx = NULL;
     }
 
+#ifdef HAVE_VAPOURSYNTH
     if (g_vs_ctx) {
         if (g_vs_ctx->node) g_vs_ctx->vsapi->freeNode(g_vs_ctx->node);
         if (g_vs_ctx->script) vsscript_freeScript(g_vs_ctx->script);
@@ -1224,8 +1467,5 @@ void video_cleanup(void) {
         free(g_vs_ctx);
         g_vs_ctx = NULL;
     }
-}
-
-#ifndef CLAMP
-#define CLAMP(x, min, max) ((x) < (min) ? (min) : ((x) > (max) ? (max) : (x)))
 #endif
+}

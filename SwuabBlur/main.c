@@ -5,18 +5,22 @@
 #include <stdbool.h>
 #include <math.h>
 #include <time.h>
-#include <getopt.h>
 #include <signal.h>
-#include <pthread.h>
 
 #ifdef _WIN32
 #include <windows.h>
 #include <io.h>
+#include "getopt.h"
 #define strcasecmp _stricmp
 #define strncasecmp _strnicmp
+typedef HANDLE pthread_mutex_t;
+typedef HANDLE pthread_t;
+#define PTHREAD_MUTEX_INITIALIZER NULL
 #else
 #include <unistd.h>
 #include <sys/time.h>
+#include <getopt.h>
+#include <pthread.h>
 #endif
 
 #include <libavcodec/avcodec.h>
@@ -28,8 +32,10 @@
 #include <libavfilter/buffersink.h>
 #include <libavfilter/buffersrc.h>
 
+#ifdef HAVE_VAPOURSYNTH
 #include <vapoursynth/VapourSynth.h>
 #include <vapoursynth/VSHelper.h>
+#endif
 
 typedef struct {
     bool blur;
@@ -90,10 +96,49 @@ extern bool video_get_info(const char* filename, int* width, int* height, double
 extern void video_cleanup(void);
 
 static volatile bool g_interrupted = false;
+
+#ifdef _WIN32
+static HANDLE g_progress_mutex = NULL;
+#else
 static pthread_mutex_t g_progress_mutex = PTHREAD_MUTEX_INITIALIZER;
+#endif
+
 static int64_t g_total_frames = 0;
 static int64_t g_processed_frames = 0;
 static time_t g_start_time = 0;
+
+#ifdef _WIN32
+static void mutex_lock(HANDLE* mutex) {
+    if (*mutex == NULL) {
+        *mutex = CreateMutex(NULL, FALSE, NULL);
+    }
+    WaitForSingleObject(*mutex, INFINITE);
+}
+
+static void mutex_unlock(HANDLE mutex) {
+    if (mutex) {
+        ReleaseMutex(mutex);
+    }
+}
+
+static void mutex_destroy(HANDLE mutex) {
+    if (mutex) {
+        CloseHandle(mutex);
+    }
+}
+#else
+static void mutex_lock(pthread_mutex_t* mutex) {
+    pthread_mutex_lock(mutex);
+}
+
+static void mutex_unlock(pthread_mutex_t* mutex) {
+    pthread_mutex_unlock(mutex);
+}
+
+static void mutex_destroy(pthread_mutex_t* mutex) {
+    pthread_mutex_destroy(mutex);
+}
+#endif
 
 static void signal_handler(int sig) {
     g_interrupted = true;
@@ -103,7 +148,7 @@ static void signal_handler(int sig) {
 static void print_progress(int64_t current, int64_t total) {
     if (!total) return;
 
-    pthread_mutex_lock(&g_progress_mutex);
+    mutex_lock(&g_progress_mutex);
 
     float percent = (float)current / total * 100.0f;
     time_t current_time = time(NULL);
@@ -119,7 +164,7 @@ static void print_progress(int64_t current, int64_t total) {
         fflush(stderr);
     }
 
-    pthread_mutex_unlock(&g_progress_mutex);
+    mutex_unlock(&g_progress_mutex);
 }
 
 static void print_usage(const char* program) {
@@ -167,10 +212,17 @@ static void print_usage(const char* program) {
     printf("  gaussian_reverse - Inverted Gaussian\n");
     printf("\n");
 
+    printf("Presets:\n");
+    printf("  gaming         - Low blur for gameplay footage\n");
+    printf("  cinematic      - Balanced blur for film content\n");
+    printf("  smooth         - High blur for maximum smoothness\n");
+    printf("\n");
+
     printf("Examples:\n");
     printf("  %s -o output.mp4 --blur-amount 1.0 input.mp4\n", program);
     printf("  %s -o smooth.mp4 --interpolate --interpolated-fps 5x --gpu input.mp4\n", program);
     printf("  %s -c config.json -o result.mp4 gameplay.mp4\n", program);
+    printf("  %s --preset gaming -o gameplay_blur.mp4 --gpu recording.mp4\n", program);
 }
 
 static bool validate_output_path(const char* path) {
@@ -236,9 +288,31 @@ static void print_summary(const BlurConfig* config) {
     printf("\n");
 }
 
+static void print_version(void) {
+    printf("SwuabBlur Motion Blur Video Processor v1.0\n");
+    printf("Built with FFmpeg %s\n", av_version_info());
+    printf("Copyright (c) 2024 SwuabBlur Contributors\n");
+    printf("\nSupported features:\n");
+    printf("  - Motion blur with multiple weighting functions\n");
+    printf("  - Frame interpolation (RIFE, SVP)\n");
+    printf("  - GPU acceleration (NVIDIA, AMD, Intel)\n");
+    printf("  - Duplicate frame detection\n");
+    printf("  - Custom FFmpeg filter chains\n");
+    printf("  - Audio processing with pitch correction\n");
+#ifdef HAVE_VAPOURSYNTH
+    printf("  - VapourSynth integration\n");
+#endif
+    printf("\n");
+}
+
 int main(int argc, char* argv[]) {
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
+
+#ifdef _WIN32
+    SetConsoleOutputCP(CP_UTF8);
+    g_progress_mutex = CreateMutex(NULL, FALSE, NULL);
+#endif
 
     BlurConfig* config = config_create();
     if (!config) {
@@ -258,20 +332,31 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
+    if (strcmp(argv[1], "--version") == 0) {
+        print_version();
+        config_destroy(config);
+        return 0;
+    }
+
     bool has_config_file = false;
     for (int i = 1; i < argc - 1; i++) {
         if (strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--config") == 0) {
-            if (!config_load_file(config, argv[i + 1])) {
-                fprintf(stderr, "Error: Failed to load config file: %s\n", argv[i + 1]);
-                config_destroy(config);
-                return 1;
+            if (i + 1 < argc) {
+                if (!config_load_file(config, argv[i + 1])) {
+                    fprintf(stderr, "Error: Failed to load config file: %s\n", argv[i + 1]);
+                    config_destroy(config);
+                    return 1;
+                }
+                has_config_file = true;
+                break;
             }
-            has_config_file = true;
-            break;
         }
     }
 
     if (!config_parse_args(config, argc, argv)) {
+        if (!has_config_file) {
+            print_usage(argv[0]);
+        }
         config_destroy(config);
         return 1;
     }
@@ -297,6 +382,7 @@ int main(int argc, char* argv[]) {
         config_print(config);
     }
 
+    printf("Analyzing input video...\n");
     int width, height;
     double fps;
     int64_t frame_count;
@@ -316,10 +402,11 @@ int main(int argc, char* argv[]) {
     g_processed_frames = 0;
     g_start_time = time(NULL);
 
+    printf("Starting video processing...\n");
     bool success = video_process(config);
 
     if (g_interrupted) {
-        fprintf(stderr, "\nProcessing interrupted\n");
+        fprintf(stderr, "\nProcessing interrupted by user\n");
         remove(config->output_file);
     }
     else if (success) {
@@ -327,10 +414,15 @@ int main(int argc, char* argv[]) {
 
         time_t end_time = time(NULL);
         double total_time = difftime(end_time, g_start_time);
-        printf("Total time: %02d:%02d:%02d\n",
+        printf("Total processing time: %02d:%02d:%02d\n",
             (int)(total_time / 3600),
             (int)(total_time / 60) % 60,
             (int)total_time % 60);
+
+        if (g_processed_frames > 0 && total_time > 0) {
+            printf("Average processing speed: %.2f fps\n",
+                (double)g_processed_frames / total_time);
+        }
     }
     else {
         fprintf(stderr, "\nProcessing failed\n");
@@ -339,6 +431,10 @@ int main(int argc, char* argv[]) {
 
     video_cleanup();
     config_destroy(config);
+
+#ifdef _WIN32
+    mutex_destroy(g_progress_mutex);
+#endif
 
     return success ? 0 : 1;
 }
