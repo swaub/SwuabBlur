@@ -1,21 +1,33 @@
 @echo off
 echo =====================================================
-echo SwuabBlur Development Environment Setup
+echo SwuabBlur Development Environment Setup - FIXED
 echo =====================================================
 echo.
 
-set SCRIPT_DIR=%~dp0
+set PROJECT_ROOT=C:\Users\Brendan\source\repos\SwuabBlur
+set SWUAB_DIR=%PROJECT_ROOT%\SwuabBlur
 set FFMPEG_DIR=C:\ffmpeg
 set VAPOURSYNTH_DIR=C:\Program Files\VapourSynth
-set THIRD_PARTY_DIR=%SCRIPT_DIR%third_party
+set THIRD_PARTY_DIR=%SWUAB_DIR%\third_party
 
 echo Creating directory structure...
 if not exist "%THIRD_PARTY_DIR%" mkdir "%THIRD_PARTY_DIR%"
 if not exist "%THIRD_PARTY_DIR%\getopt" mkdir "%THIRD_PARTY_DIR%\getopt"
-if not exist "%THIRD_PARTY_DIR%\pthreads" mkdir "%THIRD_PARTY_DIR%\pthreads"
-if not exist "%THIRD_PARTY_DIR%\pthreads\include" mkdir "%THIRD_PARTY_DIR%\pthreads\include"
-if not exist "%THIRD_PARTY_DIR%\pthreads\lib" mkdir "%THIRD_PARTY_DIR%\pthreads\lib"
 echo Done.
+echo.
+
+echo Fixing getopt.h location...
+if exist "%SWUAB_DIR%\getopt.h" (
+    copy "%SWUAB_DIR%\getopt.h" "%THIRD_PARTY_DIR%\getopt\" >nul
+    echo     [OK] getopt.h copied to correct location
+) else (
+    echo     [INFO] getopt.h not found in SwuabBlur directory
+    if exist "%THIRD_PARTY_DIR%\getopt\getopt.h" (
+        echo     [OK] getopt.h already exists in target location
+    ) else (
+        echo     [ERROR] getopt.h not found anywhere
+    )
+)
 echo.
 
 echo Checking dependencies...
@@ -37,47 +49,35 @@ if exist "%FFMPEG_DIR%\include\libavcodec\avcodec.h" (
 )
 echo.
 
-echo [2/3] Checking VapourSynth (Optional)...
-if exist "%VAPOURSYNTH_DIR%\sdk\include\VapourSynth.h" (
-    echo     [OK] VapourSynth SDK found
+echo [2/3] Checking VapourSynth...
+if exist "%VAPOURSYNTH_DIR%\sdk\include\vapoursynth\VapourSynth.h" (
+    echo     [OK] VapourSynth SDK headers found
+    if exist "%VAPOURSYNTH_DIR%\sdk\lib64" (
+        echo     [OK] VapourSynth SDK libraries found
+    ) else (
+        echo     [WARNING] VapourSynth lib64 directory not found
+    )
+    if exist "%VAPOURSYNTH_DIR%\sdk\examples" (
+        echo     [OK] VapourSynth examples found
+    )
 ) else (
     echo     [INFO] VapourSynth not found - this is optional
+    echo     Checked: %VAPOURSYNTH_DIR%\sdk\include\vapoursynth\VapourSynth.h
     echo     Download from: https://github.com/vapoursynth/vapoursynth/releases
 )
 echo.
 
-echo [3/3] Checking pthreads-win32...
-if exist "%THIRD_PARTY_DIR%\pthreads\include\pthread.h" (
-    echo     [OK] pthreads headers found
+echo [3/3] Checking getopt.h final location...
+if exist "%THIRD_PARTY_DIR%\getopt\getopt.h" (
+    echo     [OK] getopt.h found at: %THIRD_PARTY_DIR%\getopt\getopt.h
 ) else (
-    echo     [ERROR] pthreads headers not found
-    echo     Please download pthreads-win32 from SourceForge
-    echo     Extract to: %THIRD_PARTY_DIR%\pthreads\
-    set MISSING_DEPS=1
-)
-
-if exist "%THIRD_PARTY_DIR%\pthreads\lib\pthreadVC2.lib" (
-    echo     [OK] pthreads library found
-) else (
-    echo     [ERROR] pthreads library not found
-    echo     Ensure pthreadVC2.lib is in: %THIRD_PARTY_DIR%\pthreads\lib\
+    echo     [ERROR] getopt.h not found at expected location
+    echo     Expected: %THIRD_PARTY_DIR%\getopt\getopt.h
     set MISSING_DEPS=1
 )
 echo.
 
-echo Checking getopt.h...
-if exist "%THIRD_PARTY_DIR%\getopt\getopt.h" (
-    echo     [OK] getopt.h found
-) else (
-    echo     [INFO] Copying getopt.h to third_party directory...
-    if exist "%SCRIPT_DIR%SwuabBlur\getopt.h" (
-        copy "%SCRIPT_DIR%SwuabBlur\getopt.h" "%THIRD_PARTY_DIR%\getopt\" >nul
-        echo     [OK] getopt.h copied successfully
-    ) else (
-        echo     [ERROR] getopt.h not found in project directory
-        set MISSING_DEPS=1
-    )
-)
+echo Note: pthreads-win32 is not required - using Windows threading
 echo.
 
 echo Checking PATH environment...
@@ -104,7 +104,6 @@ if defined MISSING_DEPS (
     echo.
     echo Download Links:
     echo - FFmpeg: https://github.com/BtbN/FFmpeg-Builds/releases
-    echo - pthreads: https://sourceforge.net/projects/pthreads-win32/
 ) else (
     echo Status: READY
     echo.
@@ -118,6 +117,15 @@ if defined MISSING_DEPS (
     echo SwuabBlur.exe -o test.mp4 --blur-amount 1.0 input.mp4
 )
 
+echo.
+echo VapourSynth Installation Details:
+if exist "%VAPOURSYNTH_DIR%\sdk" (
+    echo SDK Path: %VAPOURSYNTH_DIR%\sdk
+    echo Include Path: %VAPOURSYNTH_DIR%\sdk\include\vapoursynth
+    echo Library Path: %VAPOURSYNTH_DIR%\sdk\lib64
+) else (
+    echo VapourSynth SDK not detected
+)
 echo.
 echo For detailed setup instructions, see the Setup Guide.
 echo.
