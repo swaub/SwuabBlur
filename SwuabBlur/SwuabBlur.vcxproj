@@ -71,12 +71,12 @@
   </ImportGroup>
   <PropertyGroup Label="UserMacros" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
-    <IncludePath>C:\ffmpeg\include;C:\Program Files\VapourSynth\sdk\include;$(ProjectDir)third_party\getopt;$(ProjectDir)third_party\pthreads\include;$(IncludePath)</IncludePath>
-    <LibraryPath>C:\ffmpeg\lib;C:\Program Files\VapourSynth\sdk\lib64;$(ProjectDir)third_party\pthreads\lib;$(LibraryPath)</LibraryPath>
+    <IncludePath>C:\ffmpeg\include;$(ProjectDir)third_party\getopt;$(IncludePath)</IncludePath>
+    <LibraryPath>C:\ffmpeg\lib;$(LibraryPath)</LibraryPath>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
-    <IncludePath>C:\ffmpeg\include;C:\Program Files\VapourSynth\sdk\include;$(ProjectDir)third_party\getopt;$(ProjectDir)third_party\pthreads\include;$(IncludePath)</IncludePath>
-    <LibraryPath>C:\ffmpeg\lib;C:\Program Files\VapourSynth\sdk\lib64;$(ProjectDir)third_party\pthreads\lib;$(LibraryPath)</LibraryPath>
+    <IncludePath>C:\ffmpeg\include;$(ProjectDir)third_party\getopt;$(IncludePath)</IncludePath>
+    <LibraryPath>C:\ffmpeg\lib;$(LibraryPath)</LibraryPath>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <ClCompile>
@@ -114,7 +114,7 @@
     <Link>
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>avcodec.lib;avformat.lib;avutil.lib;avfilter.lib;swscale.lib;vapoursynth.lib;pthreadVC2.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>avcodec.lib;avformat.lib;avutil.lib;avfilter.lib;swscale.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -129,7 +129,7 @@
     <Link>
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>avcodec.lib;avformat.lib;avutil.lib;avfilter.lib;swscale.lib;vapoursynth.lib;pthreadVC2.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>avcodec.lib;avformat.lib;avutil.lib;avfilter.lib;swscale.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
